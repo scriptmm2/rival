@@ -1,6 +1,25 @@
 -- Crystal Hub: one-file auto-execute bootstrap.
 -- Place this file in your executor's autoexecute folder for each new join.
--- Supported teleport queues reload this saved payload on server transfer.
+-- Auto-execute-safe build: avoids duplicate starts and waits for native round init.
+
+local __CrystalBootEnv = (getgenv and getgenv()) or _G
+local __CrystalCurrentJob = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
+
+if __CrystalBootEnv.__CrystalHubBootstrapRunning then
+    print("[CrystalHub] duplicate bootstrap skipped (already starting)")
+    return
+end
+
+if __CrystalBootEnv.__CrystalHubBootstrapLoadedJob == __CrystalCurrentJob
+    and game.JobId ~= ""
+    and not __CrystalBootEnv.__CrystalHubForceReload then
+    print("[CrystalHub] duplicate bootstrap skipped (already loaded in this server)")
+    return
+end
+
+__CrystalBootEnv.__CrystalHubBootstrapRunning = true
+
+print("[CrystalHub] build autoexec-roundfix-2")
 local payload = [=====[
 --[[
 	========================================================================
@@ -38,6 +57,103 @@ while not LocalPlayer do
 	LocalPlayer = Players.LocalPlayer
 end
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Auto Execute can run before the game's own client controllers have finished
+-- initializing. Requiring FighterController / CameraController first can cache
+-- them in an incomplete state. Wait for native round/runtime evidence WITHOUT
+-- requiring any game ModuleScripts.
+local CrystalRuntime = (getgenv and getgenv()) or _G
+local CrystalWorkspace = game:GetService("Workspace")
+local CrystalReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local function nativeRoundSignal()
+    local character = LocalPlayer.Character
+    local live = CrystalWorkspace:FindFirstChild("Live")
+
+    if live then
+        if live:FindFirstChild(LocalPlayer.Name)
+            or live:FindFirstChild(tostring(LocalPlayer.UserId)) then
+            return true
+        end
+
+        if character and character:IsDescendantOf(live) then
+            return true
+        end
+
+        for _, child in ipairs(live:GetChildren()) do
+            local ownerId = tonumber(child:GetAttribute("OwnerUserId")
+                or child:GetAttribute("UserId")
+                or child:GetAttribute("PlayerUserId"))
+            if ownerId == LocalPlayer.UserId then
+                return true
+            end
+        end
+    end
+
+    for _, attr in ipairs({
+        "InDuel", "InMatch", "InRound", "InGame", "InFight",
+        "IsInMatch", "IsInDuel", "MatchActive", "Fighting",
+    }) do
+        if LocalPlayer:GetAttribute(attr) == true then
+            return true
+        end
+    end
+
+    local viewModels = CrystalWorkspace:FindFirstChild("ViewModels")
+    if viewModels and viewModels:FindFirstChild("FirstPerson") then
+        return true
+    end
+
+    return false
+end
+
+local function waitForCrystalNativeClientReady()
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+
+    local playerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+    local controllers = playerScripts:WaitForChild("Controllers")
+    local modules = CrystalReplicatedStorage:WaitForChild("Modules")
+
+    print("[CrystalHub] waiting for native game client / round...")
+
+    while true do
+        local camera = CrystalWorkspace.CurrentCamera
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+
+        local controllersPresent =
+            controllers:FindFirstChild("FighterController")
+            and controllers:FindFirstChild("CameraController")
+
+        local modulesPresent =
+            modules:FindFirstChild("EnumLibrary")
+            and modules:FindFirstChild("Utility")
+
+        if camera
+            and humanoid
+            and root
+            and controllersPresent
+            and modulesPresent
+            and nativeRoundSignal() then
+            break
+        end
+
+        task.wait(0.2)
+    end
+
+    -- Let the native LocalScripts finish their own requires/connections first.
+    task.wait(1.25)
+    RunService.Heartbeat:Wait()
+    RunService.RenderStepped:Wait()
+
+    print("[CrystalHub] native client ready; loading gameplay features")
+    return true
+end
+
+CrystalRuntime.__CrystalHubWaitForNativeClientReady = waitForCrystalNativeClientReady
 
 local function viewportSize()
 	local camera = workspace.CurrentCamera
@@ -1649,20 +1765,7 @@ function Library:CreateWindow(config)
 		ZIndex = 32,
 		Parent = accountCard,
 	})
-	task.spawn(function()
-		local ok, thumbnail = pcall(function()
-			return Players:GetUserThumbnailAsync(LocalPlayer.UserId,
-				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
-		end)
-		if not (ok and accountAvatar.Parent) then return end
-		-- An executor/service wrapper can return an unexpected value. Never pass
-		-- an Instance (or its tostring name) to the ContentId property.
-		if type(thumbnail) ~= "string" or thumbnail == "" then
-			warn("[CrystalUI][AVATAR] ignored unexpected thumbnail type=" .. typeof(thumbnail))
-			return
-		end
-		accountAvatar.Image = thumbnail
-	end)
+	accountAvatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(LocalPlayer.UserId) .. "&w=100&h=100"
 
 	local grip = new("TextButton", {
 		Size                   = UDim2.fromOffset(isMobile and 30 or 18, isMobile and 30 or 18),
@@ -4817,8 +4920,17 @@ function SaveManager:ScheduleSave()
 	end)
 end
 function SaveManager:LoadAutoloadConfig()
-	if self.Prefs.AutoApply then self:Load() end
+	if self.Ready then return end
 	self.Ready = true
+	if not self.Prefs.AutoApply then return end
+	self.Loading = true
+	task.defer(function()
+		local ok, err = pcall(function() self:Load() end)
+		if not ok then
+			self.Loading = false
+			warn("[CrystalHub] autoload: " .. tostring(err))
+		end
+	end)
 end
 function SaveManager:BuildConfigSection(_)
 	if self.ConfigTab then return self.ConfigTab end
@@ -4891,14 +5003,34 @@ local cosmeticsSource = [====[
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
-local player = Players.LocalPlayer
-local playerScripts = player.PlayerScripts
-local controllers = playerScripts.Controllers
-local EnumLibrary = require(ReplicatedStorage.Modules:WaitForChild("EnumLibrary", 10))
-if EnumLibrary then EnumLibrary:WaitForEnumBuilder() end
-local CosmeticLibrary = require(ReplicatedStorage.Modules:WaitForChild("CosmeticLibrary", 10))
-local ItemLibrary = require(ReplicatedStorage.Modules:WaitForChild("ItemLibrary", 10))
-local DataController = require(controllers:WaitForChild("PlayerDataController", 10))
+if not game:IsLoaded() then game.Loaded:Wait() end
+local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local playerScripts = player:WaitForChild("PlayerScripts", 30)
+local controllers = playerScripts and playerScripts:WaitForChild("Controllers", 30)
+local modules = ReplicatedStorage:WaitForChild("Modules", 30)
+local function requireDependency(parent, name, essential)
+    local module = parent and parent:WaitForChild(name, essential and 30 or 5)
+    if not module or not module:IsA("ModuleScript") then
+        if essential then error("[COSMETICS_DEP] missing " .. name, 0) end
+        return nil
+    end
+    local lastError
+    for attempt = 1, essential and 20 or 2 do
+        local ok, value = pcall(require, module)
+        if ok and type(value) == "table" then return value end
+        lastError = tostring(value)
+        if attempt < (essential and 20 or 2) then task.wait(2) end
+    end
+    if essential then error("[COSMETICS_DEP] " .. name .. ": " .. tostring(lastError), 0) end
+    return nil
+end
+local EnumLibrary = requireDependency(modules, "EnumLibrary", false)
+if EnumLibrary and type(EnumLibrary.WaitForEnumBuilder) == "function" then
+    pcall(function() EnumLibrary:WaitForEnumBuilder() end)
+end
+local CosmeticLibrary = requireDependency(modules, "CosmeticLibrary", true)
+local ItemLibrary = requireDependency(modules, "ItemLibrary", false)
+local DataController = requireDependency(controllers, "PlayerDataController", true)
 local equipped, favorites = {}, {}
 local constructingWeapon, viewingProfile = nil, nil
 local lastUsedWeapon = nil
@@ -4979,7 +5111,7 @@ end
 -- Primary OwnsCosmetic
 local originalOwnsCosmetic = CosmeticLibrary.OwnsCosmetic
 CosmeticLibrary.OwnsCosmetic = function(self, inventory, name, weapon)
-    if name:find("MISSING_") then return originalOwnsCosmetic(self, inventory, name, weapon) end
+    if type(name) ~= "string" or name:find("MISSING_") then return originalOwnsCosmetic(self, inventory, name, weapon) end
     local cosmetic = CosmeticLibrary.Cosmetics[name]
     if cosmetic and isNotFinisher(name) then return true end
     return originalOwnsCosmetic(self, inventory, name, weapon)
@@ -5005,53 +5137,11 @@ CosmeticLibrary.OwnsCosmeticForWeapon = function(self, inventory, name, weapon)
 end
 
 -- DataController.Get – spoof inventory and favorites
-local originalGet = DataController.Get
-DataController.Get = function(self, key)
-    local data = originalGet(self, key)
-    if key == "CosmeticInventory" then
-        local proxy = {}
-        if data then
-            for k, v in pairs(data) do
-                local cosmetic = CosmeticLibrary.Cosmetics[k]
-                if cosmetic and isNotFinisher(k) then proxy[k] = v end
-            end
-        end
-        return setmetatable(proxy, {
-            __index = function(t, k)
-                local cosmetic = CosmeticLibrary.Cosmetics[k]
-                if cosmetic and isNotFinisher(k) then return true end
-                return nil
-            end
-        })
-    end
-    if key == "FavoritedCosmetics" then
-        local result = data and table.clone(data) or {}
-        for weapon, favs in pairs(favorites) do
-            result[weapon] = result[weapon] or {}
-            for name, isFav in pairs(favs) do
-                if isNotFinisher(name) then result[weapon][name] = isFav end
-            end
-        end
-        return result
-    end
-    return data
-end
+-- Keep DataController.Get untouched for native menus and weapon inventory.
 
 -- DataController.GetWeaponData – merge equipped cosmetics of any type
-local originalGetWeaponData = DataController.GetWeaponData
-DataController.GetWeaponData = function(self, weaponName)
-    local data = originalGetWeaponData(self, weaponName)
-    if not data then return nil end
-    local merged = {}
-    for key, value in pairs(data) do merged[key] = value end
-    merged.Name = weaponName
-    if equipped[weaponName] then
-        for cosmeticType, cosmeticData in pairs(equipped[weaponName]) do
-            merged[cosmeticType] = cosmeticData
-        end
-    end
-    return merged
-end
+-- Keep DataController.GetWeaponData untouched. Cosmetic viewmodel hooks
+-- below render selected skins without replacing native weapon/loadout data.
 
 -- ============================================================
 -- UNIFIED REMOTE HOOKS (EQUIP & FAVORITE)
@@ -5093,7 +5183,7 @@ if hookmetamethod then
                 if cosmeticType and isNotFinisher(cosmeticType) and isNotFinisher(cosmeticName) then
                     if cosmeticName and cosmeticName ~= "None" and cosmeticName ~= "" then
                         local inventory = DataController:Get("CosmeticInventory")
-                        if inventory and rawget(inventory, cosmeticName) then
+                        if type(inventory) == "table" and rawget(inventory, cosmeticName) then
                             return oldNamecall(self, ...) -- already owned, let server handle
                         end
                     end
@@ -5145,6 +5235,7 @@ if ClientItem and ClientItem._CreateViewModel then
         local weaponName = self.Name
         local weaponPlayer = self.ClientFighter and self.ClientFighter.Player
         constructingWeapon = (weaponPlayer == player) and weaponName or nil
+        pcall(function()
         if weaponPlayer == player and equipped[weaponName] and viewmodelRef then
             local dataKey, skinKey, charmKey, wrapKey, nameKey = self:ToEnum("Data"), self:ToEnum("Skin"), self:ToEnum("Charm"), self:ToEnum("Wrap"), self:ToEnum("Name")
             local cosmetics = equipped[weaponName]
@@ -5160,19 +5251,29 @@ if ClientItem and ClientItem._CreateViewModel then
                 if cosmetics.Skin then viewmodelRef.Data.Name = cosmetics.Skin.Name end
             end
         end
+        end)
         local result = originalCreateViewModel(self, viewmodelRef)
         constructingWeapon = nil
         return result
     end
 end
 
-local viewModelModule = player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem:FindFirstChild("ClientViewModel")
-if viewModelModule then
-    local ClientViewModel = require(viewModelModule)
+local viewModelModule
+pcall(function()
+    local modulesFolder = playerScripts:FindFirstChild("Modules")
+    local classes = modulesFolder and modulesFolder:FindFirstChild("ClientReplicatedClasses")
+    local fighter = classes and classes:FindFirstChild("ClientFighter")
+    local item = fighter and fighter:FindFirstChild("ClientItem")
+    viewModelModule = item and item:FindFirstChild("ClientViewModel")
+end)
+local ClientViewModel
+if viewModelModule then pcall(function() ClientViewModel = require(viewModelModule) end) end
+if ClientViewModel and type(ClientViewModel.new) == "function" then
     local originalNew = ClientViewModel.new
     ClientViewModel.new = function(replicatedData, clientItem)
         local weaponPlayer = clientItem.ClientFighter and clientItem.ClientFighter.Player
         local weaponName = constructingWeapon or clientItem.Name
+        pcall(function()
         if weaponPlayer == player and equipped[weaponName] then
             local ReplicatedClass = require(ReplicatedStorage.Modules.ReplicatedClass)
             local dataKey = ReplicatedClass:ToEnum("Data")
@@ -5182,18 +5283,20 @@ if viewModelModule then
             if cosmetics.Charm then replicatedData[dataKey][ReplicatedClass:ToEnum("Charm")] = cosmetics.Charm end
             if cosmetics.Wrap then replicatedData[dataKey][ReplicatedClass:ToEnum("Wrap")] = cosmetics.Wrap end
         end
+        end)
         local result = originalNew(replicatedData, clientItem)
+        pcall(function()
         if weaponPlayer == player and equipped[weaponName] and equipped[weaponName].Wrap and result._UpdateWrap then
             result:_UpdateWrap()
             task.delay(0.1, function() if not result._destroyed then result:_UpdateWrap() end end)
         end
+        end)
         return result
     end
 end
 
 -- ViewModel charm/wrap getters (if they exist)
-if viewModelModule then
-    local ClientViewModel = require(viewModelModule)
+if ClientViewModel then
     if ClientViewModel.GetCharm then
         local originalGetCharmFunc = ClientViewModel.GetCharm
         ClientViewModel.GetCharm = function(self)
@@ -5219,6 +5322,7 @@ if viewModelModule then
 end
 
 -- Fix skin image in inventory
+if ItemLibrary and type(ItemLibrary.GetViewModelImageFromWeaponData) == "function" then
 local originalGetViewModelImage = ItemLibrary.GetViewModelImageFromWeaponData
 ItemLibrary.GetViewModelImageFromWeaponData = function(self, weaponData, highRes)
     if not weaponData then return originalGetViewModelImage(self, weaponData, highRes) end
@@ -5228,6 +5332,7 @@ ItemLibrary.GetViewModelImageFromWeaponData = function(self, weaponData, highRes
         if skinInfo then return skinInfo[highRes and "ImageHighResolution" or "Image"] or skinInfo.Image end
     end
     return originalGetViewModelImage(self, weaponData, highRes)
+end
 end
 
 -- ============================================================
@@ -5306,14 +5411,27 @@ local function executeCosmetics()
     if cosmeticStatus then cosmeticStatus:Set(cosmeticState) end
     return true
 end
-task.spawn(executeCosmetics)
 
--- Queue the saved single-file payload for each game-to-game/server teleport.
+-- Do NOT auto-inject cosmetics here. During autoexecute this point is often
+-- earlier than the game's own controller initialization.
+
+-- The file itself is already in the executor's autoexecute folder.
+-- Queuing it again on teleport can result in TWO copies starting in the next
+-- server (autoexecute + queued payload). Keep teleport queue opt-in only.
 do
-    local queue = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
-    local path = "CrystalUnified/CrystalHub.lua"
-    if type(queue) == "function" and type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
-        pcall(queue, 'loadstring(readfile("CrystalUnified/CrystalHub.lua"))()')
+    local runtime = (getgenv and getgenv()) or _G
+    -- Enabled by default so lobby -> match teleports still auto-load Crystal Hub.
+    -- Set getgenv().__CrystalHubEnableTeleportQueue = false before execution
+    -- only if your executor already guarantees autoexecute on every teleport.
+    if runtime.__CrystalHubEnableTeleportQueue ~= false then
+        local queue = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+        local path = "CrystalUnified/CrystalHub.lua"
+        if type(queue) == "function"
+            and type(readfile) == "function"
+            and type(isfile) == "function"
+            and isfile(path) then
+            pcall(queue, 'loadstring(readfile("CrystalUnified/CrystalHub.lua"))()')
+        end
     end
 end
 
@@ -5343,162 +5461,7 @@ _G.Players = Players
 _G.ReplicatedStorage = ReplicatedStorage
 _G.LocalPlayer = LocalPlayer
 
-local mt = getrawmetatable(game)
-setreadonly(mt, false)
-
-local oldNamecall
-oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-    local method = getnamecallmethod()
-    if method == "Kick" and self == LocalPlayer then
-        return
-    end
-    if method == "FireServer" or method == "InvokeServer" then
-        local name = self.Name:lower()
-        if name:find("exploit") or name:find("cheat") or
-           name:find("detect") or name:find("ban") or
-           name:find("flag") or name:find("validate") or
-           name:find("integrity") or name:find("security") or
-           name:find("anticheat") or name:find("ac_") then
-            return
-        end
-    end
-    return oldNamecall(self, ...)
-end)
-
-setreadonly(mt, true)
-
-local function nukeConnections()
-    if not getconnections then return end
-    pcall(function()
-        for _, conn in ipairs(getconnections(LocalPlayer.CharacterAdded)) do
-            if not checkcaller() then
-                conn:Disable()
-            end
-        end
-    end)
-    pcall(function()
-        for _, conn in ipairs(getconnections(LocalPlayer.PlayerGui.ChildAdded)) do
-            if not checkcaller() then
-                conn:Disable()
-            end
-        end
-    end)
-end
-nukeConnections()
-
-ReplicatedStorage.DescendantAdded:Connect(function(obj)
-    if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-        local name = obj.Name:lower()
-        if name:find("exploit") or name:find("cheat") or
-           name:find("detect") or name:find("ban") or
-           name:find("flag") or name:find("validate") or
-           name:find("integrity") or name:find("security") or
-           name:find("anticheat") or name:find("ac_") then
-            pcall(function() obj:Destroy() end)
-        end
-    end
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    nukeConnections()
-end)
-
-local oldIndex
-oldIndex = hookmetamethod(game, "__index", function(self, key)
-    if checkcaller() and key == "Kick" and self == LocalPlayer then
-        return function() end
-    end
-    return oldIndex(self, key)
-end)
-
-task.spawn(function()
-    pcall(function()
-
-        local _stbl
-        _stbl = hookfunction(getrenv().setmetatable, newcclosure(function(tbl, mt)
-            if mt and typeof(mt) == "table" and rawget(mt, "__mode") == "kv" then
-                local tr = debug.traceback()
-                if tr:find("MiscellaneousController") then
-                    return _stbl({1,2,3}, {})
-                end
-            end
-            return _stbl(tbl, mt)
-        end))
-    end)
-
-    pcall(function()
-        local function _procAC(o)
-            pcall(function()
-                if o:IsA("LocalScript") or o:IsA("ModuleScript") then
-                    local _s, nm = pcall(function() return o.Name:lower() end)
-                    if not _s or not nm then return end
-                    local _tags = {"anticheat","ac","detection","ban","kick","security","moderation"}
-                    for _i = 1, #_tags do
-                        if nm:find(_tags[_i]) then
-                            pcall(function() o.Disabled = true end)
-                            break
-                        end
-                    end
-                end
-            end)
-        end
-
-        pcall(function()
-            for _, o in ipairs(game:GetDescendants()) do
-                _procAC(o)
-            end
-        end)
-
-        pcall(function() game.DescendantAdded:Connect(_procAC) end)
-    end)
-
-    pcall(function()
-        local _nc = game:GetService("NetworkClient")
-        if not _nc then return end
-        _nc.ChildAdded:Connect(function(ch)
-            pcall(function()
-                local _ok, _n = pcall(function() return ch.Name:lower() end)
-                if _ok and _n then
-                    if _n:find("anticheat") or _n:find("detection") then
-                        pcall(function() ch:Destroy() end)
-                    end
-                end
-            end)
-        end)
-    end)
-
-    pcall(function()
-        local _rf = game:GetService("ReplicatedFirst")
-        local _tgt = _rf:WaitForChild("LocalScript3", 10)
-        local _gc = getgc(false)
-        for _i = 1, #_gc do
-            local _fn = _gc[_i]
-            if type(_fn) ~= "function" then continue end
-            local _ok1, _env = pcall(getfenv, _fn)
-            if not _ok1 or type(_env) ~= "table" then continue end
-            local _ok2, _scr = pcall(function() return rawget(_env, "script") end)
-            if not _ok2 or not _scr or typeof(_scr) ~= "Instance" then continue end
-            if _scr ~= _tgt then continue end
-            local _ok4, _consts = pcall(debug.getconstants, _fn)
-            if not _ok4 or type(_consts) ~= "table" then continue end
-            for _j = 1, #_consts do
-                local _c = _consts[_j]
-                if type(_c) == "string" and (_c:find("TakeTheL") or _c:find("ban") or _c:find("kick")) then
-                    pcall(function() hookfunction(_fn, function() end) end)
-                    break
-                end
-            end
-        end
-    end)
-end)
-
-local _fakeEv
-pcall(function()
-    _fakeEv = Instance.new("RemoteEvent")
-    _fakeEv.Name = "ClientAlert"
-    _fakeEv.Parent = game:GetService("Players").LocalPlayer
-end)
+-- Keep native game remotes and round/loadout UI listeners intact.
 
 local function SendCrystalHubNotify(title, text, time)
     time = time or 5
@@ -5591,7 +5554,10 @@ local function RunLoadingBootstrap()
 
     task.wait(0.8)
 
-    pcall(PreloadCoreModules)
+    -- Disabled for autoexecute safety.
+    -- The game's own LocalScripts must be the first code to initialize its
+    -- FighterController / CameraController / Utility modules.
+    -- pcall(PreloadCoreModules)
 
     hideErrors = false
     if hideConn then hideConn:Disconnect() hideConn = nil end
@@ -6739,11 +6705,12 @@ local function shootSoundsActive()
     return _G.Features.DisableGunSounds == true
 end
 
+local isRivalsGunSound
 local function restoreGunSoundVolumes()
     local function tryRestore(root)
         if not root then return end
         for _, d in ipairs(root:GetDescendants()) do
-            if d:IsA("Sound") and isRivalsGunSound(d) and not d:GetAttribute("ShootSound") then
+            if d:IsA("Sound") and type(isRivalsGunSound) == "function" and isRivalsGunSound(d) and not d:GetAttribute("ShootSound") then
                 pcall(function()
                     if d.Volume <= 0 then
                         d.Volume = 1
@@ -6884,7 +6851,7 @@ local function isLikelyLocalProjectile(inst)
     return false
 end
 
-local function isRivalsGunSound(sound)
+isRivalsGunSound = function(sound)
     if typeof(sound) ~= "Instance" or not sound:IsA("Sound") then
         return false
     end
@@ -22662,16 +22629,71 @@ if not ok then error('body exec failed: '..tostring(res)) end
 print('[Crystal Hub] main body loaded')
 ]====]
 
-local gameplayChunk, gameplaySyntaxError = loadstring(gameplaySource)
-if not gameplayChunk then error("Gameplay compile: " .. tostring(gameplaySyntaxError)) end
-local gameplayOk, gameplayError = pcall(gameplayChunk)
-if not gameplayOk then error("Gameplay startup: " .. tostring(gameplayError)) end
-if not SaveManager.Ready then SaveManager:LoadAutoloadConfig() end
-
+cosmeticState = "Waiting for native client..."
 local cosmeticsTab = CrystalWindow:AddTab("Cosmetics")
 local cosmeticsSection = cosmeticsTab:AddSection("Unlock / equip")
 cosmeticStatus = cosmeticsSection:AddLabel(cosmeticState)
-cosmeticsSection:AddButton("Inject cosmetics now", executeCosmetics, "cosmetics_execute")
+
+local function runCosmeticsSafely()
+    task.spawn(function()
+        local waitFn = ((getgenv and getgenv()) or _G).__CrystalHubWaitForNativeClientReady
+        if type(waitFn) == "function" then
+            local readyOk, readyErr = pcall(waitFn)
+            if not readyOk then
+                warn("[CrystalHub] native readiness wait failed: " .. tostring(readyErr))
+                return
+            end
+        end
+        executeCosmetics()
+    end)
+end
+
+cosmeticsSection:AddButton("Inject cosmetics now", runCosmeticsSafely, "cosmetics_execute")
+
+-- Heavy/game-specific initialization happens in the background only after the
+-- native round is actually alive. This mirrors the timing of a manual inject
+-- during a match, which is the stable case.
+task.spawn(function()
+    local runtime = (getgenv and getgenv()) or _G
+    local waitFn = runtime.__CrystalHubWaitForNativeClientReady
+
+    if type(waitFn) == "function" then
+        local readyOk, readyErr = pcall(waitFn)
+        if not readyOk then
+            warn("[CrystalHub] native readiness wait failed: " .. tostring(readyErr))
+            if cosmeticStatus then cosmeticStatus:Set("Waiting failed") end
+            return
+        end
+    end
+
+    local jobMarker = tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
+    if runtime.__CrystalHubGameplayJob == jobMarker then
+        return
+    end
+
+    local gameplayChunk, gameplaySyntaxError = loadstring(gameplaySource)
+    if not gameplayChunk then
+        warn("[CrystalHub] Gameplay compile: " .. tostring(gameplaySyntaxError))
+        if cosmeticStatus then cosmeticStatus:Set("Gameplay compile error") end
+        return
+    end
+
+    local gameplayOk, gameplayError = pcall(gameplayChunk)
+    if not gameplayOk then
+        warn("[CrystalHub] Gameplay startup: " .. tostring(gameplayError))
+        if cosmeticStatus then cosmeticStatus:Set("Gameplay startup error") end
+        return
+    end
+
+    runtime.__CrystalHubGameplayJob = jobMarker
+
+    if not SaveManager.Ready then
+        SaveManager:LoadAutoloadConfig()
+    end
+
+    task.wait(0.45)
+    executeCosmetics()
+end)
 
 end)
 
@@ -22684,6 +22706,17 @@ if type(writefile) == "function" then
     end)
 end
 local run, compileError = loadstring(payload)
-if not run then error("Crystal Hub compile error: " .. tostring(compileError)) end
+if not run then
+    __CrystalBootEnv.__CrystalHubBootstrapRunning = false
+    error("Crystal Hub compile error: " .. tostring(compileError))
+end
+
 local ok, runError = pcall(run)
-if not ok then error("Crystal Hub execution error: " .. tostring(runError)) end
+__CrystalBootEnv.__CrystalHubBootstrapRunning = false
+
+if ok then
+    __CrystalBootEnv.__CrystalHubBootstrapLoadedJob =
+        tostring(game.PlaceId) .. ":" .. tostring(game.JobId)
+else
+    error("Crystal Hub execution error: " .. tostring(runError))
+end
